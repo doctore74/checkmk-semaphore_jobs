@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""Checkmk special agent for Semaphore UI task/job states."""
+
+
+from __future__ import annotations
+
+__author__ = "Christian Wirtz"
+__contact__ = "doc[at]snowheaven.de"
+__version__ = "1.2.0"
+
+import argparse
+import json
+import ssl
+import sys
+from collections import Counter
+from datetime import datetime, timezone
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+
+KNOWN_STATUSES = (
+    "waiting",
+    "starting",
+    "waiting_confirmation",
+    "confirmed",
+    "rejected",
+    "running",
+    "stopping",
+    "stopped",
+    "success",
+    "error",
+)
+ACTIVE_STATUSES = (
+    "waiting",
+    "starting",
+    "waiting_confirmation",
+    "confirmed",
+    "running",
+    "stopping",
+)
+AGE_STATUSES = ACTIVE_STATUSES
+TASK_LIST_LIMIT = 1000
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Monitor Semaphore UI jobs")
+    parser.add_argument("--url", required=True, help="Semaphore base URL")
+    parser.add_argument("--token", required=True, help="Semaphore API token")
+    parser.add_argument(
+        "--projects",
+        default="all",
+        help="Comma-separated project IDs or 'all'",
+    )
+    parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds")
+    parser.add_argument(
+        "--lookback-hours",
+        type=int,
+        default=24,
+        help="Lookback for completed task counters",
+    )
+    parser.add_argument(
+        "--no-verify-tls",
+        action="store_true",
+        help="Disable TLS certificate verification",
+    )
+    return parser.parse_args()
+
+
+def hide_token_from_process_title() -> None:
+    """Best effort only; Checkmk currently passes password-store values as arguments."""
+    try:
+        import setproctitle  # type: ignore[import-not-found]
+
+        setproctitle.setproctitle("agent_semaphore_jobs")
+    except Exception:
+        pass
+
+
+def error_payload(message: str) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "error": message,
+    }
+
+
+def emit(payload: dict[str, Any]) -> None:
+    print("<<<semaphore_jobs:sep(0)>>>")
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+def api_get(
+    base_url: str,
+    token: str,
+    path: str,
+    timeout: int,
+    verify_tls: bool,
+) -> Any:
+    request = Request(
+        f"{base_url.rstrip('/')}/api{path}",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "Checkmk-Semaphore-Jobs/1.2.0",
+        },
+    )
+    context = None
+    if request.full_url.lower().startswith("https://"):
+        context = ssl.create_default_context()
+        if not verify_tls:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+
+    try:
+        with urlopen(request, timeout=timeout, context=context) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        body = exc.read(500).decode("utf-8", errors="replace").replace("\n", " ")
+        raise RuntimeError(f"GET {path} returned HTTP {exc.code}: {body}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"GET {path} failed: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError(f"GET {path} timed out after {timeout}s") from exc
+
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"GET {path} returned invalid JSON") from exc
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        # Fallback for timestamps with excessive fractional precision.
+        try:
+            if "." in raw:
+                head, tail = raw.split(".", 1)
+                suffix = ""
+                fraction = tail
+                for marker in ("+", "-"):
+                    pos = tail.find(marker)
+                    if pos > 0:
+                        fraction, suffix = tail[:pos], tail[pos:]
+                        break
+                parsed = datetime.fromisoformat(f"{head}.{fraction[:6]}{suffix}")
+            else:
+                return None
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def task_time(task: dict[str, Any], fields: tuple[str, ...]) -> datetime | None:
+    for field in fields:
+        parsed = parse_timestamp(task.get(field))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def normalize_project_ids(projects: str) -> list[int] | None:
+    if projects.strip().lower() in ("", "all"):
+        return None
+    result: list[int] = []
+    for value in projects.replace(" ", "").split(","):
+        if not value:
+            continue
+        try:
+            project_id = int(value)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid project ID: {value}") from exc
+        if project_id < 1:
+            raise RuntimeError(f"Invalid project ID: {value}")
+        if project_id not in result:
+            result.append(project_id)
+    if not result:
+        raise RuntimeError("No valid project IDs configured")
+    return result
+
+
+def aggregate_project(
+    project_id: int,
+    project_name: str,
+    tasks: list[dict[str, Any]],
+    now: datetime,
+    cutoff: datetime,
+) -> dict[str, Any]:
+    counts = Counter(str(task.get("status") or "") for task in tasks)
+    status_counts = {status: counts.get(status, 0) for status in KNOWN_STATUSES}
+    unknown_statuses = {
+        status or "<empty>": count
+        for status, count in sorted(counts.items())
+        if status not in KNOWN_STATUSES
+    }
+
+    oldest_ages: dict[str, int] = {}
+    oldest_tasks: dict[str, int | None] = {}
+    invalid_timestamps = 0
+
+    for status in AGE_STATUSES:
+        oldest_seconds = 0
+        oldest_task_id: int | None = None
+        for task in tasks:
+            if task.get("status") != status:
+                continue
+            started = task_time(task, ("start", "created"))
+            if started is None:
+                invalid_timestamps += 1
+                continue
+            age = max(0, int((now - started).total_seconds()))
+            if age >= oldest_seconds:
+                oldest_seconds = age
+                task_id = task.get("id")
+                oldest_task_id = task_id if isinstance(task_id, int) else None
+        oldest_ages[status] = oldest_seconds
+        oldest_tasks[status] = oldest_task_id
+
+    recent = {"success": 0, "error": 0, "stopped": 0}
+    for task in tasks:
+        status = task.get("status")
+        if status not in recent:
+            continue
+        finished = task_time(task, ("end", "start", "created"))
+        if finished is None:
+            invalid_timestamps += 1
+            continue
+        if finished >= cutoff:
+            recent[status] += 1
+
+    returned_task_ids = [
+        task_id
+        for task in tasks
+        if isinstance((task_id := task.get("id")), int)
+    ]
+    returned_task_times = [
+        observed
+        for task in tasks
+        if (observed := task_time(task, ("created", "start", "end"))) is not None
+    ]
+
+    return {
+        "id": project_id,
+        "name": project_name,
+        "task_count": len(tasks),
+        "task_limit": TASK_LIST_LIMIT,
+        "truncated": len(tasks) >= TASK_LIST_LIMIT,
+        "returned_id_range": {
+            "minimum": min(returned_task_ids) if returned_task_ids else None,
+            "maximum": max(returned_task_ids) if returned_task_ids else None,
+        },
+        "returned_time_range": {
+            "oldest": min(returned_task_times).isoformat() if returned_task_times else None,
+            "newest": max(returned_task_times).isoformat() if returned_task_times else None,
+        },
+        "counts": status_counts,
+        "unknown_statuses": unknown_statuses,
+        "oldest_ages": oldest_ages,
+        "oldest_tasks": oldest_tasks,
+        "recent": recent,
+        "invalid_timestamps": invalid_timestamps,
+    }
+
+
+def main() -> int:
+    args = parse_args()
+    hide_token_from_process_title()
+
+    if args.timeout < 1:
+        emit(error_payload("HTTP timeout must be at least one second"))
+        return 0
+    if args.lookback_hours < 1:
+        emit(error_payload("Lookback must be at least one hour"))
+        return 0
+
+    try:
+        requested_ids = normalize_project_ids(args.projects)
+        if requested_ids is None:
+            project_data = api_get(
+                args.url,
+                args.token,
+                "/projects",
+                args.timeout,
+                not args.no_verify_tls,
+            )
+            if not isinstance(project_data, list):
+                raise RuntimeError("GET /projects did not return an array")
+            projects = []
+            for project in project_data:
+                if not isinstance(project, dict) or not isinstance(project.get("id"), int):
+                    continue
+                project_id = project["id"]
+                name = str(project.get("name") or f"Project {project_id}")
+                projects.append((project_id, name))
+        else:
+            projects = [(project_id, f"Project {project_id}") for project_id in requested_ids]
+
+        if not projects:
+            raise RuntimeError("No Semaphore projects are accessible with this token")
+
+        now = datetime.now(timezone.utc)
+        cutoff = now.timestamp() - args.lookback_hours * 3600
+        cutoff_dt = datetime.fromtimestamp(cutoff, tz=timezone.utc)
+        project_results = []
+
+        for project_id, project_name in projects:
+            task_data = api_get(
+                args.url,
+                args.token,
+                f"/project/{quote(str(project_id), safe='')}/tasks",
+                args.timeout,
+                not args.no_verify_tls,
+            )
+            if not isinstance(task_data, list):
+                raise RuntimeError(f"Task response for project {project_id} is not an array")
+            valid_tasks = [task for task in task_data if isinstance(task, dict)]
+            project_results.append(
+                aggregate_project(project_id, project_name, valid_tasks, now, cutoff_dt)
+            )
+
+        totals = {
+            "counts": {status: 0 for status in KNOWN_STATUSES},
+            "oldest_ages": {status: 0 for status in AGE_STATUSES},
+            "recent": {"success": 0, "error": 0, "stopped": 0},
+            "unknown_statuses": {},
+            "invalid_timestamps": 0,
+            "truncated_projects": 0,
+            "task_count": 0,
+        }
+        for project in project_results:
+            totals["task_count"] += project["task_count"]
+            totals["invalid_timestamps"] += project["invalid_timestamps"]
+            totals["truncated_projects"] += int(project["truncated"])
+            for status in KNOWN_STATUSES:
+                totals["counts"][status] += project["counts"][status]
+            for status in AGE_STATUSES:
+                totals["oldest_ages"][status] = max(
+                    totals["oldest_ages"][status], project["oldest_ages"][status]
+                )
+            for status in totals["recent"]:
+                totals["recent"][status] += project["recent"][status]
+            for status, count in project["unknown_statuses"].items():
+                totals["unknown_statuses"][status] = (
+                    totals["unknown_statuses"].get(status, 0) + count
+                )
+
+        totals["active"] = sum(totals["counts"][status] for status in ACTIVE_STATUSES)
+        totals["unknown_count"] = sum(totals["unknown_statuses"].values())
+
+        emit(
+            {
+                "version": 1,
+                "fetched_at": now.isoformat(),
+                "lookback_hours": args.lookback_hours,
+                "project_count": len(project_results),
+                "totals": totals,
+                "projects": project_results,
+            }
+        )
+        return 0
+    except Exception as exc:
+        emit(error_payload(str(exc)))
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

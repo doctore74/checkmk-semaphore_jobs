@@ -1,0 +1,27 @@
+title: Semaphore UI jobs
+agents: special
+catalog: applications
+license: MIT
+distribution: check_mk
+description:
+ This check monitors task states from the Semaphore UI REST API. It reports
+ current jobs in running, waiting and transitional states, the age of the
+ oldest job per active state, recent success/error/stopped counts, unknown
+ statuses, invalid timestamps, and potentially incomplete API task history.
+
+ The API connection is configured under Setup > Agents > Other integrations >
+ Semaphore UI jobs. Thresholds are configured with the service monitoring rule
+ Semaphore UI jobs.
+discovery:
+ One service named "Semaphore Jobs" is discovered when the special agent returns
+ a semaphore_jobs section.
+check:
+ Running jobs are informational. WARN/CRIT defaults focus on queue accumulation,
+ jobs that remain in transitional states too long, old running jobs, recent
+ failed jobs, and incomplete or unexpected API data.
+
+notes:
+ Project summaries are displayed on separate lines. Semaphore currently limits
+ the project task-list endpoint to 1,000 records. When that limit is reached,
+ the service details identify the affected project, its ID, and the returned
+ task range so the reason for the data-quality warning is visible.
