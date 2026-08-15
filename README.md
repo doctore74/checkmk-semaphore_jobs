@@ -374,7 +374,7 @@ Email: **doc[at]snowheaven.de**
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under [GPL-2.0-only](LICENSE).
 
 ## References
 
