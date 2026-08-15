@@ -1,3 +1,9 @@
+# macOS
+.DS_Store
+
+# Built package (attached to GitHub releases, not committed)
+*.mkp
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

@@ -7,7 +7,7 @@ import tarfile
 import tempfile
 
 NAME = "semaphore_jobs"
-VERSION = "1.2.0"
+VERSION = "1.2.2"
 BASE = Path(__file__).resolve().parent
 PLUGIN_BASE = BASE / "local/lib/python3/cmk_addons/plugins"
 FAMILY = PLUGIN_BASE / NAME
@@ -16,7 +16,10 @@ OUTPUT = BASE / f"{NAME}-{VERSION}.mkp"
 files = sorted(
     str(path.relative_to(PLUGIN_BASE))
     for path in FAMILY.rglob("*")
-    if path.is_file() and path.suffix != ".pyc" and "__pycache__" not in path.parts
+    if path.is_file()
+    and path.suffix != ".pyc"
+    and path.name != ".DS_Store"
+    and "__pycache__" not in path.parts
 )
 info = {
     "author": "Christian Wirtz <doc[at]snowheaven.de>",
