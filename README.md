@@ -307,31 +307,10 @@ The service exposes metrics for graphing, including:
 
 Metric names use the `semaphore_` prefix.
 
-## Building the MKP
+## Building from source
 
-Clone the repository and execute:
-
-```bash
-git clone <YOUR-GITHUB-REPOSITORY-URL>
-cd <REPOSITORY-DIRECTORY>
-python3 build_mkp.py
-```
-
-The build script creates:
-
-```text
-semaphore_jobs-1.2.1.mkp
-```
-
-It reproducibly packages the files below `local/lib/python3/cmk_addons/plugins/semaphore_jobs/` and writes both Checkmk metadata formats (`info` and `info.json`).
-
-Validate the generated package on a Checkmk 2.5 test site before publishing a release:
-
-```bash
-mkp add ./semaphore_jobs-1.2.1.mkp
-mkp enable semaphore_jobs 1.2.1
-cmk-validate-plugins
-```
+Building and testing the package, the CI pipeline and the repository layout are
+described in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## Repository workflow
 
@@ -355,17 +334,6 @@ Create a GitHub release for version `1.2.1` and attach `semaphore_jobs-1.2.1.mkp
 - Keep TLS verification enabled wherever possible.
 - The Checkmk server-side call resolves password-store values when constructing the special-agent command. The collector makes a best-effort attempt to replace its process title when the optional `setproctitle` module is available, but command-line exposure may still be possible briefly on the Checkmk server.
 - Do not include API tokens in debug output, issue reports, screenshots, or repository commits.
-
-## Development
-
-Contributions and issue reports are welcome. Useful issue reports should include:
-
-- Checkmk edition and exact version
-- Semaphore UI version
-- Plug-in version
-- Output of `cmk-validate-plugins`
-- Relevant `cmk --debug` error text with credentials removed
-- A sanitized `<<<semaphore_jobs:sep(0)>>>` section when the issue concerns parsing or counters
 
 ## Author
 
